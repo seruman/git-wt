@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+
+# Nix build and direnv state
+/.direnv/
+/.envrc.local
+/result
+/result-*
+
+# Local agent instructions and implementation notes
+/SPEC.md
+/VALIDATION.md
+/AGENTS.md
+/CLAUDE.md
+/.agents/
+/.claude/
+/.pi/
+
+# macOS metadata
+.DS_Store

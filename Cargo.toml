@@ -1,0 +1,22 @@
+[package]
+name = "git-wt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+description = "Git worktrees with APFS clones"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+walkdir = "2"
+url = "2"
+percent-encoding = "2"
+libc = "0.2"
+
+[profile.release]
+lto = true
+strip = true
