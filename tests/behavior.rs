@@ -1338,7 +1338,7 @@ fn explicit_path_bypasses_remote_and_handles_whitespace_json() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t["path"] == ps(&destination))
+            .any(|t| t["path"] == ps(&destination) && t["bare"] == false)
     );
 
     assert_eq!(
@@ -1726,28 +1726,61 @@ fn branch_namespace_collision_and_separate_git_directory() {
 
 // A private process group lets timeout/panic cleanup stop Git and its hooks
 // before a test drops their temporary directories.
-struct TestChild(Option<std::process::Child>);
+struct TestChild(Option<std::process::Child>, std::time::Instant);
 
 impl TestChild {
     fn spawn(command: &mut Command) -> Self {
         use std::{os::unix::process::CommandExt, process::Stdio};
 
-        Self(Some(
-            command
-                .process_group(0)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap(),
-        ))
+        Self(
+            Some(
+                command
+                    .process_group(0)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(15),
+        )
+    }
+
+    fn signal_process(&self, signal: libc::c_int) {
+        let child = self.0.as_ref().unwrap();
+        // SAFETY: the child is live and unreaped, so its PID cannot be reused.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, signal);
+        }
+    }
+
+    fn read_stderr_byte(&mut self) -> u8 {
+        use std::{io::Read, os::fd::AsRawFd};
+
+        let stderr = self.0.as_mut().unwrap().stderr.as_mut().unwrap();
+        let mut descriptor = libc::pollfd {
+            fd: stderr.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining = self.1.saturating_duration_since(std::time::Instant::now());
+
+        // SAFETY: poll borrows one live descriptor for the duration of the call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, remaining.as_millis() as i32) };
+        assert!(
+            ready > 0,
+            "test child did not produce stderr before its deadline"
+        );
+
+        let mut byte = [0];
+        stderr.read_exact(&mut byte).unwrap();
+        byte[0]
     }
 
     fn wait(mut self) -> std::process::Output {
         use std::time::{Duration, Instant};
 
-        let deadline = Instant::now() + Duration::from_secs(15);
         while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "test child timed out");
+            assert!(Instant::now() < self.1, "test child timed out");
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -2022,4 +2055,367 @@ fn hook_failure_cleans_registered_worktree_and_retains_branch() {
             .count(),
         1
     );
+}
+
+#[test]
+fn base_start_points_reach_git_verbatim_so_tracking_is_configured() {
+    let r = Repo::new();
+    let initial = r.git(&r.root, &["rev-parse", "HEAD"]);
+    fs::write(r.root.join("tracked"), "next\n").unwrap();
+    r.git(&r.root, &["commit", "-qam", "next"]);
+    r.git(
+        &r.root,
+        &["update-ref", "refs/remotes/origin/feature", &initial],
+    );
+
+    let output: Value = serde_json::from_str(
+        &r.run(
+            &r.root,
+            &[
+                "new",
+                "tracking",
+                "--no-clone",
+                "--json",
+                "--base",
+                "origin/feature",
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(output["head"], initial);
+    let tree = Path::new(output["path"].as_str().unwrap());
+    assert_eq!(r.git(tree, &["rev-parse", "HEAD"]), initial);
+    assert_eq!(
+        r.git(&r.root, &["config", "branch.tracking.remote"]),
+        "origin"
+    );
+    assert_eq!(
+        r.git(&r.root, &["config", "branch.tracking.merge"]),
+        "refs/heads/feature"
+    );
+
+    let plain = r.new_tree(&["new", "plain-base", "--no-clone", "--base", &initial]);
+    assert_eq!(r.git(&plain, &["rev-parse", "HEAD"]), initial);
+    assert!(
+        r.run(
+            &r.root,
+            &["new", "bad-base", "--no-clone", "--base", "missing-ref"]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn base_retries_a_retained_branch_only_at_the_same_commit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let r = Repo::new();
+    let initial = r.git(&r.root, &["rev-parse", "HEAD"]);
+    fs::write(r.root.join("tracked"), "next\n").unwrap();
+    r.git(&r.root, &["commit", "-qam", "next"]);
+    let next = r.git(&r.root, &["rev-parse", "HEAD"]);
+
+    let hook = r.root.join(".git/hooks/post-checkout");
+    fs::write(&hook, "#!/bin/sh\nprintf 'hook failed\\n' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let failure = r
+        .run(&r.root, &["new", "retry", "--no-clone", "--base", &initial])
+        .unwrap_err()
+        .to_string();
+    assert!(failure.contains("retained"), "{failure}");
+
+    fs::remove_file(hook).unwrap();
+    let tree = r.new_tree(&["new", "retry", "--no-clone", "--base", &initial]);
+    assert_eq!(r.git(&tree, &["rev-parse", "HEAD"]), initial);
+
+    r.git(&r.root, &["branch", "other"]);
+    let output = r
+        .command(env!("CARGO_BIN_EXE_git-wt"))
+        .args(["new", "other", "--no-clone", "--base", &initial])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("another branch name"), "{error}");
+    assert!(!error.contains("branch -D"), "{error}");
+    assert_eq!(r.git(&r.root, &["rev-parse", "refs/heads/other"]), next);
+    assert!(
+        !r.trees
+            .join("gitlab.example/group/team/repo/other")
+            .exists()
+    );
+}
+
+#[test]
+fn retargeting_recognizes_any_alias_that_resolves_to_the_source_root() {
+    use std::os::unix::fs::symlink;
+
+    let r = Repo::new();
+    let base = r.root.parent().unwrap();
+    let alias = base.join("alias");
+    symlink(&r.root, &alias).unwrap();
+    fs::create_dir(base.join("elsewhere")).unwrap();
+    fs::write(base.join("elsewhere/sentinel"), "outside").unwrap();
+
+    fs::create_dir(r.root.join("cache")).unwrap();
+    let links = [
+        ("through-alias", alias.join("tracked"), Some("tracked")),
+        (
+            "dangling-alias",
+            alias.join("missing/file"),
+            Some("missing/file"),
+        ),
+        ("alias-root", alias.clone(), Some("")),
+        ("alias-parent", alias.join("cache/../tracked"), None),
+        ("outside", base.join("elsewhere/sentinel"), None),
+    ];
+    for (name, target, _) in &links {
+        symlink(target, r.root.join("cache").join(name)).unwrap();
+    }
+
+    let tree = r.new_tree(&["new", "aliases"]);
+
+    for (name, target, retargeted) in &links {
+        let expected = match retargeted {
+            Some(relative) => tree.join(relative),
+            None => target.clone(),
+        };
+        assert_eq!(
+            fs::read_link(tree.join("cache").join(name)).unwrap(),
+            expected,
+            "{name}"
+        );
+    }
+
+    assert_eq!(
+        fs::read_to_string(tree.join("cache/through-alias")).unwrap(),
+        "base\n"
+    );
+    assert_eq!(
+        fs::read_to_string(tree.join("cache/outside")).unwrap(),
+        "outside"
+    );
+}
+
+#[test]
+fn missing_home_without_a_configured_root_is_reported_as_such() {
+    let r = Repo::new();
+    r.git(&r.root, &["config", "--unset", "gwt.root"]);
+
+    let output = r
+        .command(env!("CARGO_BIN_EXE_git-wt"))
+        .args(["new", "homeless", "--no-clone"])
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("HOME"), "{error}");
+    assert!(!error.contains("gwt.root must be absolute"), "{error}");
+    assert!(r.git(&r.root, &["branch", "--list", "homeless"]).is_empty());
+}
+
+#[test]
+fn remove_prunes_empty_namespace_directories_below_the_repository_parent() {
+    let r = Repo::new();
+    let parent = r.trees.join("gitlab.example/group/team/repo");
+    let a = r.new_tree(&["new", "feature/deep/a", "--no-clone"]);
+    let b = r.new_tree(&["new", "feature/b", "--no-clone"]);
+
+    r.run(&r.root, &["remove", "feature/deep/a"]).unwrap();
+    assert!(!a.exists());
+    assert!(!parent.join("feature/deep").exists());
+    assert!(b.join(".git").is_file());
+
+    fs::write(parent.join("feature/note"), "keep").unwrap();
+    r.run(&r.root, &["remove", "feature/b"]).unwrap();
+    assert!(!b.exists());
+    assert_eq!(
+        fs::read_to_string(parent.join("feature/note")).unwrap(),
+        "keep"
+    );
+
+    fs::remove_file(parent.join("feature/note")).unwrap();
+    let last = r.new_tree(&["new", "feature/last", "--no-clone"]);
+    r.run(&r.root, &["remove", "feature/last"]).unwrap();
+    assert!(!last.exists());
+    assert!(!parent.join("feature").exists());
+    assert!(parent.is_dir());
+
+    let outside = r.trees.join("outside/tree");
+    r.new_tree(&["new", "outside", "--no-clone", "--path", ps(&outside)]);
+    r.run(&r.root, &["remove", "outside"]).unwrap();
+    assert!(!outside.exists());
+    assert!(r.trees.join("outside").is_dir());
+}
+
+#[test]
+fn remove_never_prunes_the_repository_parent_or_its_ancestors() {
+    let r = Repo::new();
+    let parent = r.trees.join("gitlab.example/group/team/repo");
+
+    let tree = r.new_tree(&["new", "whole-parent", "--no-clone", "--path", ps(&parent)]);
+    assert_eq!(tree, parent);
+    r.run(&r.root, &["remove", "whole-parent"]).unwrap();
+
+    assert!(!parent.exists());
+    assert!(
+        parent.parent().unwrap().is_dir(),
+        "namespace directory pruned"
+    );
+    assert!(r.trees.is_dir(), "gwt.root pruned");
+
+    let sibling = r.trees.join("gitlab.example/group/team/other");
+    let tree = r.new_tree(&["new", "sibling", "--no-clone", "--path", ps(&sibling)]);
+    assert_eq!(tree, sibling);
+    r.run(&r.root, &["remove", "sibling"]).unwrap();
+    assert!(!sibling.exists());
+    assert!(sibling.parent().unwrap().is_dir());
+}
+
+fn real_git() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .unwrap()
+}
+
+#[test]
+fn start_points_that_move_during_creation_are_refused_with_rollback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (dirty, moved_ref) in [
+        (false, "refs/remotes/origin/feature"),
+        (true, "refs/heads/moving"),
+    ] {
+        let r = Repo::new();
+        let initial = r.git(&r.root, &["rev-parse", "HEAD"]);
+        fs::write(r.root.join("tracked"), "next\n").unwrap();
+        r.git(&r.root, &["commit", "-qam", "next"]);
+        let next = r.git(&r.root, &["rev-parse", "HEAD"]);
+        r.git(&r.root, &["update-ref", moved_ref, &next]);
+        fs::write(r.root.join("untracked"), "working").unwrap();
+        let source_index = fs::read(r.root.join(".git/index")).unwrap();
+
+        // A Git wrapper that moves the start point exactly when the worktree is
+        // added, then defers to the installed Git. Nothing is emulated.
+        let wrappers = r.root.parent().unwrap().join("wrappers");
+        fs::create_dir(&wrappers).unwrap();
+        fs::write(
+            wrappers.join("git"),
+            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = add ]; then\n  \"$GWT_TEST_REAL_GIT\" -C \"$GWT_TEST_SOURCE\" update-ref \"$GWT_TEST_MOVED_REF\" \"$GWT_TEST_MOVED_TO\"\nfi\nexec \"$GWT_TEST_REAL_GIT\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(wrappers.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(wrappers.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+
+        let destination = r.trees.join("moving");
+        let mut args = vec!["new", "moving", "--json", "--path", ps(&destination)];
+        if dirty {
+            args.push("--dirty");
+        } else {
+            args.extend(["--base", "origin/feature"]);
+        }
+
+        let output = r
+            .command(env!("CARGO_BIN_EXE_git-wt"))
+            .args(&args)
+            .env("PATH", &path)
+            .env("GWT_TEST_REAL_GIT", real_git())
+            .env("GWT_TEST_SOURCE", &r.root)
+            .env("GWT_TEST_MOVED_REF", moved_ref)
+            .env("GWT_TEST_MOVED_TO", &initial)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "dirty={dirty}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "dirty={dirty}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("moved"), "dirty={dirty}: {error}");
+
+        assert!(!destination.exists(), "dirty={dirty}");
+        assert_eq!(
+            r.git(&r.root, &["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count(),
+            1
+        );
+        r.git(&r.root, &["rev-parse", "--verify", "refs/heads/moving"]);
+        assert_eq!(fs::read(r.root.join(".git/index")).unwrap(), source_index);
+        assert_eq!(r.git(&r.root, &["rev-parse", moved_ref]), initial);
+
+        // The retained branch sits wherever Git left it. Settle the moved ref on
+        // that commit, keep the wrapper's update a no-op, and the same
+        // invocation succeeds at the commit it reports.
+        let settled = if dirty {
+            next.clone()
+        } else {
+            r.git(&r.root, &["rev-parse", "refs/heads/moving"])
+        };
+        r.git(&r.root, &["update-ref", moved_ref, &settled]);
+        let output = r
+            .command(env!("CARGO_BIN_EXE_git-wt"))
+            .args(&args)
+            .env("PATH", &path)
+            .env("GWT_TEST_REAL_GIT", real_git())
+            .env("GWT_TEST_SOURCE", &r.root)
+            .env("GWT_TEST_MOVED_REF", moved_ref)
+            .env("GWT_TEST_MOVED_TO", &settled)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "dirty={dirty}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["head"], settled);
+        assert_eq!(r.git(&destination, &["rev-parse", "HEAD"]), settled);
+    }
+}
+
+#[test]
+fn signals_terminate_creation_without_success_output() {
+    use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        let r = Repo::new();
+        let source_index = fs::read(r.root.join(".git/index")).unwrap();
+        let hook = r.root.join(".git/hooks/post-checkout");
+        fs::write(&hook, "#!/bin/sh\nawk 'BEGIN { for (i = 0; i < 20000; i++) print \"hook diagnostic line\" }' >&2\n").unwrap();
+        fs::set_permissions(hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let destination = r.trees.join("interrupted");
+        let mut child = TestChild::spawn(r.command(env!("CARGO_BIN_EXE_git-wt")).args([
+            "new",
+            "interrupted",
+            "--json",
+            "--no-clone",
+            "--path",
+            ps(&destination),
+        ]));
+
+        // Git and its hook have finished; git-wt is blocked forwarding captured
+        // diagnostics. Only the CLI is still running when it is signalled.
+        child.read_stderr_byte();
+        child.signal_process(signal);
+        let output = child.wait();
+
+        assert_eq!(output.status.signal(), Some(signal));
+        assert!(output.stdout.is_empty());
+        assert_eq!(fs::read(r.root.join(".git/index")).unwrap(), source_index);
+    }
 }

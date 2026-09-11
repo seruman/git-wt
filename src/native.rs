@@ -36,40 +36,65 @@ const UNSUPPORTED: &[i32] = &[
 
 const CLONE_NOFOLLOW: u32 = 1;
 
+/// The source root under the spellings a symlink target can use for it.
+pub struct SourceRoot {
+    spellings: Vec<PathBuf>,
+    canonical: PathBuf,
+}
+
+impl SourceRoot {
+    pub fn new(root: &Path) -> io::Result<Self> {
+        let canonical = root.canonicalize()?;
+        let mut spellings = vec![root.to_path_buf()];
+        if canonical != root {
+            spellings.push(canonical.clone());
+        }
+
+        Ok(Self {
+            spellings,
+            canonical,
+        })
+    }
+
+    /// The part of an absolute link below the source root, however it is spelled.
+    fn relative<'a>(&self, link: &'a Path) -> Option<&'a Path> {
+        if let Some(relative) = self
+            .spellings
+            .iter()
+            .find_map(|root| link.strip_prefix(root).ok())
+        {
+            return Some(relative);
+        }
+
+        // Git reports physical paths, while links written by tools keep the
+        // user's spelling, such as /tmp for /private/tmp or a symlinked home
+        // directory. Resolve only ancestors, so a dangling target still counts.
+        link.ancestors()
+            .find(|ancestor| {
+                ancestor
+                    .canonicalize()
+                    .is_ok_and(|resolved| resolved == self.canonical)
+            })
+            .and_then(|ancestor| link.strip_prefix(ancestor).ok())
+    }
+}
+
 /// An absolute link into the source tree must point into the clone instead.
-pub fn retarget(link: &Path, source_roots: &[PathBuf], destination: &Path) -> Option<PathBuf> {
+pub fn retarget(link: &Path, source: &SourceRoot, destination: &Path) -> Option<PathBuf> {
     // Parent traversal can cross a symlink boundary or escape the source.
     // Preserve its stored spelling, even for apparently internal `..`, rather
     // than guessing containment or requiring dangling targets to exist.
-    if link
-        .components()
-        .any(|part| matches!(part, std::path::Component::ParentDir))
+    if !link.is_absolute()
+        || link
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
     {
         return None;
     }
 
-    source_roots
-        .iter()
-        .find_map(|root| link.strip_prefix(root).ok())
+    source
+        .relative(link)
         .map(|relative| destination.join(relative))
-}
-
-pub fn root_spellings(root: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut roots = vec![root.to_path_buf()];
-    let canonical = root.canonicalize()?;
-    if canonical != root {
-        roots.push(canonical.clone());
-    }
-
-    // Git reports /private paths even when symlinks retain the user's shorter spelling.
-    if let Ok(relative) = canonical.strip_prefix("/private") {
-        let alias = Path::new("/").join(relative);
-        if !roots.contains(&alias) && alias.canonicalize().ok().as_ref() == Some(&canonical) {
-            roots.push(alias);
-        }
-    }
-
-    Ok(roots)
 }
 
 /// Clone one regular file with APFS copy-on-write semantics, preserving its mode.

@@ -79,18 +79,23 @@ pub fn parent(cwd: &Path) -> Result<PathBuf> {
         .context("cannot resolve repository remote; supply --path")?;
     let (url, repo) = remote_path(&url)?;
 
-    let root = git::optional(
+    let root = match git::optional(
         cwd,
         &["config", "--path", "--get-urlmatch", "gwt.root", &url],
-    )?
-    .map(PathBuf::from)
-    .unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("worktrees")
-    });
+    )? {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            if !root.is_absolute() {
+                bail!("gwt.root must be absolute (~/ is supported by Git)");
+            }
 
-    if !root.is_absolute() {
-        bail!("gwt.root must be absolute (~/ is supported by Git)");
-    }
+            root
+        }
+        None => std::env::var_os("HOME")
+            .filter(|home| Path::new(home).is_absolute())
+            .map(|home| PathBuf::from(home).join("worktrees"))
+            .context("gwt.root is not configured and HOME is not an absolute path")?,
+    };
 
     // This is a directory boundary, not the final entry being reserved.
     // Resolve its own symlink too, so containment uses one physical namespace.

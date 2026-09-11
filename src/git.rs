@@ -99,16 +99,17 @@ pub fn run_in_worktree(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
     )
 }
 
-pub fn text(cwd: &Path, args: &[&str]) -> Result<String> {
-    let bytes = run(cwd, args)?;
+fn line(bytes: Vec<u8>) -> Result<String> {
     let value = String::from_utf8(bytes).context("Git returned non-UTF-8 data")?;
     Ok(value.strip_suffix('\n').unwrap_or(&value).to_owned())
 }
 
+pub fn text(cwd: &Path, args: &[&str]) -> Result<String> {
+    line(run(cwd, args)?)
+}
+
 pub fn text_in_worktree(cwd: &Path, args: &[&str]) -> Result<String> {
-    let bytes = run_in_worktree(cwd, args)?;
-    let value = String::from_utf8(bytes).context("Git returned non-UTF-8 data")?;
-    Ok(value.strip_suffix('\n').unwrap_or(&value).to_owned())
+    line(run_in_worktree(cwd, args)?)
 }
 
 pub fn optional(cwd: &Path, args: &[&str]) -> Result<Option<String>> {
@@ -123,8 +124,7 @@ pub fn optional(cwd: &Path, args: &[&str]) -> Result<Option<String>> {
         );
     }
 
-    let value = String::from_utf8(out.stdout).context("Git returned non-UTF-8 data")?;
-    Ok(Some(value.strip_suffix('\n').unwrap_or(&value).to_owned()))
+    line(out.stdout).map(Some)
 }
 
 /// Validate a selected checkout itself, not an enclosing repository discovered by Git.
@@ -176,7 +176,6 @@ pub struct Worktree {
     pub lock_reason: Option<String>,
     pub prunable: bool,
     pub prune_reason: Option<String>,
-    #[serde(skip)]
     pub bare: bool,
 }
 

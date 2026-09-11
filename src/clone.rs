@@ -269,7 +269,7 @@ fn directories(destination: &Path, rel: &Path, created: &mut Vec<PathBuf>) -> io
 }
 
 pub fn populate(source: &Path, destination: &Path, entries: &[Entry]) -> Result<Stats> {
-    let roots = native::root_spellings(source)?;
+    let source_root = native::SourceRoot::new(source)?;
 
     let mut stats = Stats::default();
     let mut dirs = Vec::new();
@@ -301,7 +301,7 @@ pub fn populate(source: &Path, destination: &Path, entries: &[Entry]) -> Result<
                 Err(error) if disappeared(&error, &src, entry.disposable) => continue,
                 Err(error) => return Err(error).context("reading source symlink"),
             };
-            let target = native::retarget(&target, &roots, destination).unwrap_or(target);
+            let target = native::retarget(&target, &source_root, destination).unwrap_or(target);
 
             match std::os::unix::fs::symlink(target, &dst) {
                 Ok(()) => stats.symlinks += 1,

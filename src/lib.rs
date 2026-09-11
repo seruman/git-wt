@@ -36,21 +36,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Create a worktree and clone ignored environment files
-    New {
-        branch: Option<String>,
-        #[arg(long)]
-        base: Option<String>,
-        #[arg(long)]
-        path: Option<PathBuf>,
-        #[arg(long, conflicts_with = "no_clone")]
-        dirty: bool,
-        #[arg(long)]
-        exclude: Vec<String>,
-        #[arg(long)]
-        no_clone: bool,
-        #[arg(long)]
-        json: bool,
-    },
+    New(NewOptions),
 
     /// List worktrees registered with Git
     #[command(visible_alias = "ls")]
@@ -153,6 +139,20 @@ fn branch_exists(cwd: &Path, branch: &str) -> Result<bool> {
     .is_some())
 }
 
+/// Where to create the transient APFS probe file. The administrative directory
+/// keeps it away from file watchers and `git status`, but only represents the
+/// checkout's volume when both share a device.
+fn probe_directory(cwd: &Path, src: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let git_dir = PathBuf::from(git::text(cwd, &["rev-parse", "--absolute-git-dir"])?);
+    let same_volume = fs::metadata(&git_dir)
+        .and_then(|admin| Ok(admin.dev() == fs::metadata(src)?.dev()))
+        .unwrap_or(false);
+
+    Ok(if same_volume { git_dir } else { src.to_owned() })
+}
+
 fn exists(p: &Path) -> Result<bool> {
     match fs::symlink_metadata(p) {
         Ok(_) => Ok(true),
@@ -198,190 +198,194 @@ pub fn execute(cli: Cli) -> Result<String> {
     path_str(&cwd)?;
 
     match cli.command {
-        Commands::New {
-            branch,
-            base,
-            path,
-            dirty,
-            exclude,
-            no_clone,
+        Commands::New(options) => new(&cwd, options),
+        Commands::List { json } => list(inventory(&cwd)?, json),
+        Commands::Path {
+            worktree,
+            main,
             json,
-        } => {
-            if dirty && no_clone {
-                return Err(usage("--dirty conflicts with --no-clone"));
-            }
-
-            new(
-                &cwd,
-                NewOptions {
-                    branch,
-                    base,
-                    path,
-                    dirty,
-                    exclude,
-                    no_clone,
-                    json,
-                },
-            )
-        }
-        command => {
-            let current = source(&cwd).ok();
-            let mut trees = git::inventory(&cwd)?;
-
-            // Git's inventory can report the administrative directory for a main
-            // checkout created with --separate-git-dir. When invoked in that main
-            // checkout, Git can resolve its real root without a private registry.
-            if let Some(root) = &current {
-                let git_dir = git::text(&cwd, &["rev-parse", "--absolute-git-dir"])?;
-                let common = git::text(
-                    &cwd,
-                    &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                )?;
-
-                if git_dir == common
-                    && let Some(primary) = trees.iter_mut().find(|t| t.primary)
-                {
-                    primary.path = root.clone();
-                }
-            }
-
-            for tree in &mut trees {
-                tree.current = current.as_ref() == Some(&tree.path);
-            }
-
-            match command {
-                Commands::List { json } => {
-                    if json {
-                        return Ok(format!("{}\n", serde_json::to_string(&trees)?));
-                    }
-
-                    let path_width = trees
-                        .iter()
-                        .map(|tree| Ok(path_str(&tree.path)?.chars().count()))
-                        .collect::<Result<Vec<_>>>()?
-                        .into_iter()
-                        .max()
-                        .unwrap_or(0);
-
-                    let kind_width = trees
-                        .iter()
-                        .map(|tree| {
-                            if tree.branch.is_some() {
-                                "branch"
-                            } else if tree.bare {
-                                "bare"
-                            } else {
-                                "detached"
-                            }
-                            .chars()
-                            .count()
-                        })
-                        .max()
-                        .unwrap_or(0);
-
-                    let branch_width = trees
-                        .iter()
-                        .map(|tree| tree.branch.as_deref().unwrap_or("-").chars().count())
-                        .max()
-                        .unwrap_or(0);
-
-                    let mut out = String::new();
-                    for tree in trees {
-                        let path = path_str(&tree.path)?;
-                        let head = tree
-                            .head
-                            .as_deref()
-                            .map(|head| &head[..head.len().min(8)])
-                            .unwrap_or("--------");
-
-                        let kind = if tree.branch.is_some() {
-                            "branch"
-                        } else if tree.bare {
-                            "bare"
-                        } else {
-                            "detached"
-                        };
-                        let branch = tree.branch.as_deref().unwrap_or("-");
-
-                        let status = match (tree.locked, tree.prunable) {
-                            (false, false) => "-",
-                            (true, false) => "locked",
-                            (false, true) => "prunable",
-                            (true, true) => "locked,prunable",
-                        };
-
-                        out.push_str(&format!(
-                            "{} {path:<path_width$} {head} {kind:<kind_width$} {branch:<branch_width$} {status}\n",
-                            if tree.current { "*" } else { " " },
-                        ));
-                    }
-
-                    Ok(out)
-                }
-
-                Commands::Path {
-                    worktree,
-                    main,
-                    json,
-                } => {
-                    if main && worktree.is_some() {
-                        return Err(usage("--main conflicts with a selector"));
-                    }
-
-                    let tree = if main {
-                        trees
-                            .iter()
-                            .find(|t| t.primary)
-                            .context("no primary working tree")?
-                    } else if let Some(selector) = worktree {
-                        select(&trees, &selector, &cwd)?
-                    } else {
-                        trees
-                            .iter()
-                            .find(|t| t.current)
-                            .context("not inside a working tree")?
-                    };
-
-                    git::validate_worktree(&cwd, &tree.path).with_context(|| {
-                        format!(
-                            "Git did not resolve an accessible working tree at {}",
-                            tree.path.display()
-                        )
-                    })?;
-
-                    formatted_path(&tree.path, json)
-                }
-
-                Commands::Remove { worktree, force } => {
-                    let tree = select(&trees, &worktree, &cwd)?;
-                    if tree.primary || tree.current || tree.bare {
-                        bail!("cannot remove the primary or current worktree");
-                    }
-
-                    let mut args = vec!["worktree", "remove"];
-                    if force {
-                        args.push("--force");
-                    }
-                    args.extend(["--", path_str(&tree.path)?]);
-
-                    git::run_worktree_mutation(&cwd, &args)?;
-                    Ok(String::new())
-                }
-
-                Commands::New { .. } => unreachable!(),
-            }
-        }
+        } => path(&cwd, &inventory(&cwd)?, worktree.as_deref(), main, json),
+        Commands::Remove { worktree, force } => remove(&cwd, &inventory(&cwd)?, &worktree, force),
     }
 }
 
-struct NewOptions {
-    branch: Option<String>,
-    base: Option<String>,
-    path: Option<PathBuf>,
-    dirty: bool,
-    exclude: Vec<String>,
-    no_clone: bool,
+/// Registered worktrees with the current one marked.
+fn inventory(cwd: &Path) -> Result<Vec<git::Worktree>> {
+    let current = source(cwd).ok();
+    let mut trees = git::inventory(cwd)?;
+
+    // Git's inventory can report the administrative directory for a main
+    // checkout created with --separate-git-dir. When invoked in that main
+    // checkout, Git can resolve its real root without a private registry.
+    if let Some(root) = &current {
+        let git_dir = git::text(cwd, &["rev-parse", "--absolute-git-dir"])?;
+        let common = git::text(
+            cwd,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+
+        if git_dir == common
+            && let Some(primary) = trees.iter_mut().find(|t| t.primary)
+        {
+            primary.path = root.clone();
+        }
+    }
+
+    for tree in &mut trees {
+        tree.current = current.as_ref() == Some(&tree.path);
+    }
+
+    Ok(trees)
+}
+
+fn list(trees: Vec<git::Worktree>, json: bool) -> Result<String> {
+    if json {
+        return Ok(format!("{}\n", serde_json::to_string(&trees)?));
+    }
+
+    struct Row<'a> {
+        current: bool,
+        path: &'a str,
+        head: &'a str,
+        kind: &'a str,
+        branch: &'a str,
+        status: &'a str,
+    }
+
+    let rows = trees
+        .iter()
+        .map(|tree| {
+            Ok(Row {
+                current: tree.current,
+                path: path_str(&tree.path)?,
+                head: tree
+                    .head
+                    .as_deref()
+                    .map(|head| &head[..head.len().min(8)])
+                    .unwrap_or("--------"),
+                kind: if tree.branch.is_some() {
+                    "branch"
+                } else if tree.bare {
+                    "bare"
+                } else {
+                    "detached"
+                },
+                branch: tree.branch.as_deref().unwrap_or("-"),
+                status: match (tree.locked, tree.prunable) {
+                    (false, false) => "-",
+                    (true, false) => "locked",
+                    (false, true) => "prunable",
+                    (true, true) => "locked,prunable",
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let (mut path_width, mut kind_width, mut branch_width) = (0, 0, 0);
+    for row in &rows {
+        path_width = path_width.max(row.path.chars().count());
+        kind_width = kind_width.max(row.kind.chars().count());
+        branch_width = branch_width.max(row.branch.chars().count());
+    }
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{} {:<path_width$} {} {:<kind_width$} {:<branch_width$} {}\n",
+                if row.current { "*" } else { " " },
+                row.path,
+                row.head,
+                row.kind,
+                row.branch,
+                row.status,
+            )
+        })
+        .collect())
+}
+
+fn path(
+    cwd: &Path,
+    trees: &[git::Worktree],
+    selector: Option<&str>,
+    main: bool,
     json: bool,
+) -> Result<String> {
+    let tree = if main {
+        trees
+            .iter()
+            .find(|t| t.primary)
+            .context("no primary working tree")?
+    } else if let Some(selector) = selector {
+        select(trees, selector, cwd)?
+    } else {
+        trees
+            .iter()
+            .find(|t| t.current)
+            .context("not inside a working tree")?
+    };
+
+    git::validate_worktree(cwd, &tree.path).with_context(|| {
+        format!(
+            "Git did not resolve an accessible working tree at {}",
+            tree.path.display()
+        )
+    })?;
+
+    formatted_path(&tree.path, json)
+}
+
+fn remove(cwd: &Path, trees: &[git::Worktree], selector: &str, force: bool) -> Result<String> {
+    let tree = select(trees, selector, cwd)?;
+    if tree.primary || tree.current || tree.bare {
+        bail!("cannot remove the primary or current worktree");
+    }
+
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.extend(["--", path_str(&tree.path)?]);
+
+    git::run_worktree_mutation(cwd, &args)?;
+
+    // Namespaced branches leave empty directories such as <repo>/feature/
+    // behind. Prune them strictly below the configured parent only, when that
+    // parent can be resolved at all; the parent and everything above it stay.
+    if let Ok(parent) = naming::parent(cwd)
+        && let Ok(below) = tree.path.strip_prefix(&parent)
+        && !below.as_os_str().is_empty()
+    {
+        let empty = tree
+            .path
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| *ancestor != parent);
+        for directory in empty {
+            if fs::remove_dir(directory).is_err() {
+                break;
+            }
+        }
+    }
+
+    Ok(String::new())
+}
+
+#[derive(clap::Args, Debug)]
+pub struct NewOptions {
+    pub branch: Option<String>,
+    #[arg(long)]
+    pub base: Option<String>,
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+    #[arg(long, conflicts_with = "no_clone")]
+    pub dirty: bool,
+    #[arg(long)]
+    pub exclude: Vec<String>,
+    #[arg(long)]
+    pub no_clone: bool,
+    #[arg(long)]
+    pub json: bool,
 }
 
 fn new(cwd: &Path, options: NewOptions) -> Result<String> {
@@ -448,16 +452,28 @@ fn new(cwd: &Path, options: NewOptions) -> Result<String> {
     }
 
     let existing = branch_exists(cwd, &branch)?;
-    if existing && options.base.is_some() {
-        return Err(usage("--base requires a new branch"));
-    }
 
-    let start = if existing {
-        commit(cwd, &format!("refs/heads/{branch}"))?
+    // Git receives the start point as written, so a remote-tracking base still
+    // sets up upstream tracking exactly as `git worktree add -b` would.
+    let (start, start_point) = if existing {
+        let tip = commit(cwd, &format!("refs/heads/{branch}"))?;
+
+        // A failed creation retains its new branch. Accept the same --base again
+        // so the command can simply be repeated, but never silently move a branch.
+        if let Some(base) = &options.base
+            && commit(cwd, base)? != tip
+        {
+            return Err(usage(&format!(
+                "--base requires a new branch, and branch {branch} already exists \
+                 at a different commit; inspect it or choose another branch name"
+            )));
+        }
+
+        (tip, branch.clone())
     } else if let Some(base) = options.base {
-        commit(cwd, &base)?
+        (commit(cwd, &base)?, base)
     } else {
-        head.clone()
+        (head.clone(), head.clone())
     };
     if options.dirty && start != head {
         return Err(usage("--dirty requires the source HEAD as starting commit"));
@@ -501,7 +517,7 @@ fn new(cwd: &Path, options: NewOptions) -> Result<String> {
     fs::create_dir_all(dst_parent)?;
 
     if !options.no_clone {
-        clone::probe(&src, dst_parent)
+        clone::probe(&probe_directory(cwd, &src)?, dst_parent)
             .context("APFS cloning unavailable; use --no-clone for an ordinary worktree")?;
     }
 
@@ -517,13 +533,7 @@ fn new(cwd: &Path, options: NewOptions) -> Result<String> {
             args.extend(["-b", &branch]);
         }
 
-        args.extend(["--", path_str(&dst)?]);
-        let reference = if existing {
-            branch.as_str()
-        } else {
-            start.as_str()
-        };
-        args.push(reference);
+        args.extend(["--", path_str(&dst)?, &start_point]);
 
         if let Err(error) = git::run_worktree_mutation(cwd, &args) {
             // Git can register a worktree before a checkout hook reports failure.
@@ -540,6 +550,13 @@ fn new(cwd: &Path, options: NewOptions) -> Result<String> {
             return Err(error);
         }
         owns_worktree = true;
+
+        // Git resolved the start point itself, so a ref that moved since it was
+        // captured yields a checkout of another commit than the one reported.
+        let checked_out = git::text_in_worktree(&dst, &["rev-parse", "--verify", "HEAD"])?;
+        if checked_out != start {
+            bail!("start point {start_point} moved from {start} to {checked_out} during creation");
+        }
 
         let stats = if options.no_clone {
             clone::Stats::default()
@@ -558,6 +575,10 @@ fn new(cwd: &Path, options: NewOptions) -> Result<String> {
         Ok(stats) => stats,
         Err(error) => {
             let cleanup = (|| -> Result<()> {
+                // Git may have already removed its failed addition.
+                if !exists(&dst)? {
+                    return Ok(());
+                }
                 if !reservation.still_owns_directory()? {
                     bail!("destination ownership changed; refusing cleanup");
                 }

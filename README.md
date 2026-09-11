@@ -41,6 +41,9 @@ creation are skipped. `--dirty` carries working changes without preserving
 staging. `--no-clone` creates an ordinary worktree without carrying local files.
 Use `--force` with `remove` to discard uncommitted files and changes.
 
+Git or copy errors trigger best-effort cleanup; new branches are kept.
+Interruptions or crashes may leave an incomplete worktree.
+
 Git handles branches, merging, and pushing as usual. Run `git wt -h` for help.
 
 ## Install from source
