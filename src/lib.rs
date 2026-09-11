@@ -48,8 +48,9 @@ pub enum Commands {
     /// Print a worktree's absolute path
     Path {
         worktree: Option<String>,
+        /// Select the main worktree, regardless of its branch
         #[arg(long, conflicts_with = "worktree")]
-        main: bool,
+        main_worktree: bool,
         #[arg(long)]
         json: bool,
     },
@@ -202,9 +203,15 @@ pub fn execute(cli: Cli) -> Result<String> {
         Commands::List { json } => list(inventory(&cwd)?, json),
         Commands::Path {
             worktree,
-            main,
+            main_worktree,
             json,
-        } => path(&cwd, &inventory(&cwd)?, worktree.as_deref(), main, json),
+        } => path(
+            &cwd,
+            &inventory(&cwd)?,
+            worktree.as_deref(),
+            main_worktree,
+            json,
+        ),
         Commands::Remove { worktree, force } => remove(&cwd, &inventory(&cwd)?, &worktree, force),
     }
 }
@@ -308,10 +315,10 @@ fn path(
     cwd: &Path,
     trees: &[git::Worktree],
     selector: Option<&str>,
-    main: bool,
+    main_worktree: bool,
     json: bool,
 ) -> Result<String> {
-    let tree = if main {
+    let tree = if main_worktree {
         trees
             .iter()
             .find(|t| t.primary)

@@ -1158,7 +1158,7 @@ fn source_is_current_linked_worktree_and_paths_survive_git_moves() {
     );
 
     assert_eq!(
-        r.run(&child, &["path", "--main"]).unwrap(),
+        r.run(&child, &["path", "--main-worktree"]).unwrap(),
         format!("{}\n", r.root.display())
     );
 
@@ -1657,7 +1657,9 @@ fn cli_errors_and_stdout_contract() {
     for args in [
         vec!["new", "--dirty", "--no-clone"],
         vec!["push"],
-        vec!["path", "main", "--main"],
+        vec!["path", "main", "--main-worktree"],
+        vec!["path", "--main"],
+        vec!["path", "--primary"],
         vec!["-C", ps(&r.root), "list"],
     ] {
         let out = r
@@ -1695,6 +1697,28 @@ fn cli_errors_and_stdout_contract() {
 }
 
 #[test]
+fn main_worktree_path_is_independent_of_branch_name() {
+    let r = Repo::new();
+    r.git(&r.root, &["branch", "-m", "trunk"]);
+    let linked = r.new_tree(&["new", "main", "--no-clone"]);
+
+    assert_eq!(
+        r.run(&linked, &["path", "main"]).unwrap(),
+        format!("{}\n", linked.display())
+    );
+    assert_eq!(
+        r.run(&linked, &["path", "--main-worktree"]).unwrap(),
+        format!("{}\n", r.root.display())
+    );
+
+    let output = r
+        .run(&linked, &["path", "--main-worktree", "--json"])
+        .unwrap();
+    let value: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["path"], ps(&r.root));
+}
+
+#[test]
 fn branch_namespace_collision_and_separate_git_directory() {
     let r = Repo::new();
     r.git(&r.root, &["branch", "main-1/child"]);
@@ -1708,13 +1732,13 @@ fn branch_namespace_collision_and_separate_git_directory() {
     r.git(&r.root, &["worktree", "repair"]);
 
     assert_eq!(
-        r.run(&r.root, &["path", "--main"]).unwrap(),
+        r.run(&r.root, &["path", "--main-worktree"]).unwrap(),
         format!("{}\n", r.root.display())
     );
 
     // Git itself reports the admin directory from a linked worktree here.
     // Do not invent a registry or return that administrative directory as a checkout.
-    assert!(r.run(&new, &["path", "--main"]).is_err());
+    assert!(r.run(&new, &["path", "--main-worktree"]).is_err());
 
     let child = r.run(&new, &["new", "--no-clone"]).unwrap();
     assert!(
