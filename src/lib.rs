@@ -1,4 +1,5 @@
 mod clone;
+mod copy_rules;
 mod git;
 pub mod naming;
 mod native;
@@ -387,8 +388,8 @@ pub struct NewOptions {
     pub path: Option<PathBuf>,
     #[arg(long, conflicts_with = "no_clone")]
     pub dirty: bool,
-    #[arg(long)]
-    pub exclude: Vec<String>,
+    #[arg(long, value_name = "PATTERN", conflicts_with = "no_clone")]
+    pub ignore: Vec<String>,
     #[arg(long)]
     pub no_clone: bool,
     #[arg(long)]
@@ -496,18 +497,6 @@ fn new(cwd: &Path, options: NewOptions) -> Result<String> {
         bail!("destination already exists: {}", dst.display());
     }
 
-    let mut excludes = git::optional(cwd, &["config", "--null", "--get-all", "gwt.exclude"])?
-        .map(|s| {
-            s.split('\0')
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    excludes.extend(options.exclude);
-    let excludes = clone::exclusions(excludes).map_err(|e| usage(&e.to_string()))?;
-
     let nested: Vec<PathBuf> = git::inventory(cwd)?
         .into_iter()
         .map(|t| t.path)
@@ -517,7 +506,8 @@ fn new(cwd: &Path, options: NewOptions) -> Result<String> {
     let entries = if options.no_clone {
         Vec::new()
     } else {
-        clone::plan(cwd, &src, options.dirty, &excludes, &nested, &dst)?
+        let rules = copy_rules::CopyRules::load(cwd, &src, &options.ignore)?;
+        clone::plan(cwd, &src, options.dirty, &rules, &nested, &dst)?
     };
 
     let dst_parent = dst.parent().context("destination needs a parent")?;

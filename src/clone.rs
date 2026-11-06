@@ -1,4 +1,4 @@
-use crate::{git, native};
+use crate::{copy_rules::CopyRules, git, native};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::{
@@ -40,37 +40,11 @@ pub struct Stats {
     pub symlinks: u64,
 }
 
-pub fn exclusions(values: Vec<String>) -> Result<Vec<PathBuf>> {
-    values
-        .into_iter()
-        .map(|s| {
-            let p = PathBuf::from(s);
-            if p.is_absolute()
-                || p.components()
-                    .any(|p| matches!(p, std::path::Component::ParentDir))
-            {
-                bail!("exclusions must be source-relative paths without parent traversal");
-            }
-
-            let p: PathBuf = p
-                .components()
-                .filter(|p| !matches!(p, std::path::Component::CurDir))
-                .collect();
-            if p.as_os_str().is_empty() {
-                bail!("exclusion cannot be empty or the source root");
-            }
-
-            git::path_str(&p)?;
-            Ok(p)
-        })
-        .collect()
-}
-
 pub fn plan(
     git_cwd: &Path,
     source: &Path,
     dirty: bool,
-    exclude: &[PathBuf],
+    rules: &CopyRules,
     nested: &[PathBuf],
     destination: &Path,
 ) -> Result<Vec<Entry>> {
@@ -121,7 +95,6 @@ pub fn plan(
     };
 
     let ignored: HashSet<PathBuf> = ignored.into_iter().collect();
-    let excluded_roots: HashSet<&Path> = exclude.iter().map(PathBuf::as_path).collect();
 
     let protected_dirs: HashSet<PathBuf> = protected
         .iter()
@@ -188,7 +161,7 @@ pub fn plan(
             }
 
             let is_ignored = rel.ancestors().any(|p| ignored.contains(p));
-            let excluded = rel.ancestors().any(|p| excluded_roots.contains(p));
+            let excluded = rules.excludes(rel, is_dir);
             let protected_here = if is_dir {
                 protected_dirs.contains(rel)
             } else {

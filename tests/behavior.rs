@@ -373,7 +373,8 @@ fn ignored_root_symlinks_are_leaves_even_when_dangling_or_cyclic() {
         );
     }
 
-    let excluded = r.new_tree(&["new", "excluded-link", "--exclude", "ignored-directory"]);
+    fs::write(r.root.join(".wtignore"), "/ignored-directory\n").unwrap();
+    let excluded = r.new_tree(&["new", "excluded-link"]);
     assert!(!excluded.join("ignored-directory").is_symlink());
     assert!(excluded.join("ignored-dangling").is_symlink());
 }
@@ -833,6 +834,8 @@ fn source_environment_is_honored_without_redirecting_destination_git() {
 
     fs::write(r.root.join("tracked"), "working").unwrap();
     fs::write(r.root.join(".env"), "excluded by command-line config").unwrap();
+    let rules = r.home.join("copy rules");
+    fs::write(&rules, ".env\n").unwrap();
 
     let source_index_path = r.root.join(".git/index");
     let source_index = fs::read(&source_index_path).unwrap();
@@ -847,8 +850,8 @@ fn source_environment_is_honored_without_redirecting_destination_git() {
                 ("GIT_WORK_TREE", ".."),
                 ("GIT_INDEX_FILE", ps(&source_index_path)),
                 ("GIT_CONFIG_COUNT", "1"),
-                ("GIT_CONFIG_KEY_0", "gwt.exclude"),
-                ("GIT_CONFIG_VALUE_0", ".env"),
+                ("GIT_CONFIG_KEY_0", "gwt.ignoreFile"),
+                ("GIT_CONFIG_VALUE_0", ps(&rules)),
             ],
         )
         .unwrap();
@@ -887,6 +890,8 @@ fn worktree_creation_does_not_use_the_sources_index() {
 
         fs::write(source.join("tracked"), "working").unwrap();
         fs::write(source.join(".env"), "environment").unwrap();
+        let rules = r.home.join("copy rules");
+        fs::write(&rules, "cache/\n").unwrap();
 
         let index = PathBuf::from(r.git(
             &source,
@@ -909,8 +914,8 @@ fn worktree_creation_does_not_use_the_sources_index() {
                     ("GIT_WORK_TREE", ".."),
                     ("GIT_INDEX_FILE", ps(&index)),
                     ("GIT_CONFIG_COUNT", "1"),
-                    ("GIT_CONFIG_KEY_0", "gwt.exclude"),
-                    ("GIT_CONFIG_VALUE_0", "cache"),
+                    ("GIT_CONFIG_KEY_0", "gwt.ignoreFile"),
+                    ("GIT_CONFIG_VALUE_0", ps(&rules)),
                 ],
             )
             .unwrap();
@@ -1179,17 +1184,9 @@ fn exclusions_only_remove_ignored_files_and_match_components() {
     fs::write(r.root.join("target"), "nonignored").unwrap();
     fs::write(r.root.join("target-old"), "keep").unwrap();
 
-    r.git(&r.root, &["config", "--add", "gwt.exclude", ".env"]);
+    fs::write(r.root.join(".wtignore"), ".env\n/cache/\ntarget\n").unwrap();
 
-    let tree = r.new_tree(&[
-        "new",
-        "dirty",
-        "--dirty",
-        "--exclude",
-        "./cache/",
-        "--exclude",
-        "target",
-    ]);
+    let tree = r.new_tree(&["new", "dirty", "--dirty"]);
 
     assert!(tree.join("cache/tracked").is_file());
     assert!(!tree.join("cache/ignored").exists());
@@ -1198,6 +1195,94 @@ fn exclusions_only_remove_ignored_files_and_match_components() {
     assert!(tree.join("target-old").is_file());
 
     assert!(!tree.join(".env").exists());
+}
+
+#[test]
+fn negated_exclusions_clone_only_reincluded_paths() {
+    let r = Repo::new();
+    fs::write(r.root.join(".env"), "keep").unwrap();
+    fs::create_dir_all(r.root.join("cache/keep")).unwrap();
+    fs::write(r.root.join("cache/keep/data"), "keep").unwrap();
+    fs::write(r.root.join("cache/drop"), "drop").unwrap();
+
+    fs::write(
+        r.root.join(".wtignore"),
+        "/*\n!/.env\n!/cache/\n/cache/*\n!/cache/keep/\n",
+    )
+    .unwrap();
+
+    let tree = r.new_tree(&["new", "allowlist"]);
+
+    assert!(tree.join("tracked").is_file());
+    assert!(tree.join(".env").is_file());
+    assert!(tree.join("cache/keep/data").is_file());
+    assert!(!tree.join("cache/drop").exists());
+
+    fs::write(r.root.join(".wtignore"), "/cache/\n!/cache/keep/\n").unwrap();
+    let tree = r.new_tree(&["new", "excluded-parent"]);
+    assert!(!tree.join("cache").exists());
+}
+
+#[test]
+fn global_exclusions_match_from_the_source_and_wtignore_wins() {
+    let r = Repo::new();
+    fs::write(r.root.join(".env"), "environment").unwrap();
+    fs::create_dir_all(r.root.join("cache/nested")).unwrap();
+    fs::write(r.root.join("cache/data"), "cache").unwrap();
+    fs::write(r.root.join("cache/nested/data"), "cache").unwrap();
+
+    fs::write(r.home.join("wtignore"), ".env\n/cache/data\n").unwrap();
+    r.git(&r.root, &["config", "gwt.ignoreFile", "~/wtignore"]);
+    fs::write(r.root.join(".wtignore"), "!/.env\n").unwrap();
+
+    let output = r.run(&r.root.join("cache"), &["new", "global"]).unwrap();
+    let tree = PathBuf::from(output.trim_end());
+
+    assert!(tree.join(".env").is_file());
+    assert!(!tree.join("cache/data").exists());
+    assert!(tree.join("cache/nested/data").is_file());
+}
+
+#[test]
+fn ignore_flags_apply_after_ignore_files() {
+    let r = Repo::new();
+    fs::write(r.root.join(".env"), "environment").unwrap();
+    fs::create_dir(r.root.join("cache")).unwrap();
+    fs::write(r.root.join("cache/data"), "cache").unwrap();
+    fs::write(r.root.join("cache/data.log"), "log").unwrap();
+
+    fs::write(r.root.join(".wtignore"), ".env\n").unwrap();
+
+    let tree = r.new_tree(&["new", "flags", "--ignore", "!/.env", "--ignore", "*.log"]);
+
+    assert!(tree.join(".env").is_file());
+    assert!(tree.join("cache/data").is_file());
+    assert!(!tree.join("cache/data.log").exists());
+
+    assert!(
+        r.run(&r.root, &["new", "invalid", "--ignore", "[z-a]"])
+            .is_err()
+    );
+    assert!(r.git(&r.root, &["branch", "--list", "invalid"]).is_empty());
+}
+
+#[test]
+fn invalid_exclusions_fail_before_creation() {
+    let r = Repo::new();
+    r.git(&r.root, &["config", "gwt.ignoreFile", "~/missing"]);
+    assert!(r.run(&r.root, &["new", "missing"]).is_err());
+
+    r.git(&r.root, &["config", "--unset", "gwt.ignoreFile"]);
+    fs::write(r.root.join(".wtignore"), "[z-a]\n").unwrap();
+    assert!(r.run(&r.root, &["new", "invalid"]).is_err());
+
+    assert!(!r.trees.exists());
+    assert!(
+        r.git(&r.root, &["branch", "--list", "missing", "invalid"])
+            .is_empty()
+    );
+
+    r.new_tree(&["new", "plain", "--no-clone"]);
 }
 
 #[test]
@@ -1485,6 +1570,11 @@ fn registered_nested_worktrees_are_pruned_during_clone() {
     let nested = r.root.join("cache/nested");
     r.git(&r.root, &["worktree", "add", "-b", "nested", ps(&nested)]);
     fs::write(r.root.join("cache/plain"), "keep").unwrap();
+    fs::write(
+        r.root.join(".wtignore"),
+        "/*\n!/*\n!/.git/\n!/cache/nested/\n",
+    )
+    .unwrap();
 
     let tree = r.new_tree(&["new", "copy", "--dirty"]);
 
@@ -1656,6 +1746,7 @@ fn cli_errors_and_stdout_contract() {
 
     for args in [
         vec!["new", "--dirty", "--no-clone"],
+        vec!["new", "--exclude", "cache"],
         vec!["push"],
         vec!["path", "main", "--main-worktree"],
         vec!["path", "--main"],

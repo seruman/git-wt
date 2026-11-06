@@ -32,19 +32,48 @@ The scoped URL must match your remote's scheme and host. The default remote is
 
 ```sh
 git wt new fix-auth --path ../fix-auth
-git wt new fix-auth --exclude node_modules
 git wt new fix-auth --no-clone
 ```
 
 Existing destination files are kept. Ignored files that disappear during
 creation are skipped. `--dirty` carries working changes without preserving
 staging. `--no-clone` creates an ordinary worktree without carrying local files.
-Use `--force` with `remove` to discard uncommitted files and changes.
+Use `--force` with `remove` to discard uncommitted files and changes. Ignored
+files are removed either way.
 
 Git or copy errors trigger best-effort cleanup; new branches are kept.
 Interruptions or crashes may leave an incomplete worktree.
 
 Git handles branches, merging, and pushing as usual. Run `git wt -h` for help.
+
+To skip some ignored files, list them in `.wtignore` at the source checkout's
+root, using gitignore syntax. `!` negates a pattern. To clone only a few paths:
+
+```gitignore
+/*
+!/.env
+!/node_modules/
+```
+
+For rules shared across repositories, set `gwt.ignoreFile` to a file in the
+same format. Its patterns also match from the source root, and `.wtignore`
+rules override them:
+
+```gitconfig
+[gwt]
+    ignoreFile = ~/.config/git/wtignore
+```
+
+`--ignore <PATTERN>` adds a pattern for one run, after both files, so it can
+also negate them:
+
+```sh
+git wt new fix-auth --ignore node_modules/ --ignore '!/.env'
+```
+
+Rules only filter ignored files. `--dirty` still carries all working changes.
+Cloned files keep embedded absolute paths, so an environment such as a
+Python `.venv` may still point at the source checkout.
 
 ## Install from source
 
