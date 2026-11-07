@@ -55,14 +55,10 @@ root, using gitignore syntax. `!` negates a pattern. To clone only a few paths:
 !/node_modules/
 ```
 
-For rules shared across repositories, set `gwt.ignoreFile` to a file in the
-same format. Its patterns also match from the source root, and `.wtignore`
-rules override them:
-
-```gitconfig
-[gwt]
-    ignoreFile = ~/.config/git/wtignore
-```
+Rules shared across repositories go in `~/.config/git/wtignore` (under
+`$XDG_CONFIG_HOME` if set), in the same format. Its patterns also match from
+the source root, and `.wtignore` rules override them. Set `gwt.ignoreFile` to
+use a different file instead.
 
 `--ignore <PATTERN>` adds a pattern for one run, after both files, so it can
 also negate them:

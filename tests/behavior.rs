@@ -1244,6 +1244,36 @@ fn global_exclusions_match_from_the_source_and_wtignore_wins() {
 }
 
 #[test]
+fn default_ignore_file_follows_xdg_and_config_replaces_it() {
+    let r = Repo::new();
+    fs::write(r.root.join(".env"), "environment").unwrap();
+    fs::create_dir(r.root.join("cache")).unwrap();
+    fs::write(r.root.join("cache/data"), "cache").unwrap();
+
+    fs::create_dir_all(r.home.join("xdg/git")).unwrap();
+    fs::write(r.home.join("xdg/git/wtignore"), ".env\n").unwrap();
+    fs::create_dir_all(r.home.join(".config/git")).unwrap();
+    fs::write(r.home.join(".config/git/wtignore"), "/cache/\n").unwrap();
+
+    let tree = r.new_tree(&["new", "xdg"]);
+    assert!(!tree.join(".env").exists());
+    assert!(tree.join("cache/data").is_file());
+
+    let output = r
+        .run_with_env(&r.root, &["new", "home"], &[("XDG_CONFIG_HOME", "")])
+        .unwrap();
+    let tree = PathBuf::from(output.trim_end());
+    assert!(tree.join(".env").is_file());
+    assert!(!tree.join("cache").exists());
+
+    fs::write(r.home.join("other"), "").unwrap();
+    r.git(&r.root, &["config", "gwt.ignoreFile", "~/other"]);
+    let tree = r.new_tree(&["new", "configured"]);
+    assert!(tree.join(".env").is_file());
+    assert!(tree.join("cache/data").is_file());
+}
+
+#[test]
 fn ignore_flags_apply_after_ignore_files() {
     let r = Repo::new();
     fs::write(r.root.join(".env"), "environment").unwrap();
