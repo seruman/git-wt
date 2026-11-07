@@ -251,9 +251,14 @@ fn list(trees: Vec<git::Worktree>, json: bool) -> Result<String> {
         return Ok(format!("{}\n", serde_json::to_string(&trees)?));
     }
 
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.canonicalize().unwrap_or(home));
+
     struct Row<'a> {
         current: bool,
-        path: &'a str,
+        path: String,
         head: &'a str,
         kind: &'a str,
         branch: &'a str,
@@ -265,7 +270,7 @@ fn list(trees: Vec<git::Worktree>, json: bool) -> Result<String> {
         .map(|tree| {
             Ok(Row {
                 current: tree.current,
-                path: path_str(&tree.path)?,
+                path: display_path(&tree.path, home.as_deref())?,
                 head: tree
                     .head
                     .as_deref()
@@ -310,6 +315,14 @@ fn list(trees: Vec<git::Worktree>, json: bool) -> Result<String> {
             )
         })
         .collect())
+}
+
+fn display_path(path: &Path, home: Option<&Path>) -> Result<String> {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => Ok("~".into()),
+        Some(rest) => Ok(format!("~/{}", path_str(rest)?)),
+        None => Ok(path_str(path)?.into()),
+    }
 }
 
 fn path(

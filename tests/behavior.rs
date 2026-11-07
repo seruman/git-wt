@@ -1497,6 +1497,35 @@ fn human_list_has_aligned_path_head_checkout_and_status_columns() {
 }
 
 #[test]
+fn human_list_abbreviates_home_but_json_stays_absolute() {
+    let r = Repo::new();
+    let inside = r.home.join("trees/inside");
+    let sibling = r.home.with_file_name("homex").join("outside");
+    fs::create_dir_all(inside.parent().unwrap()).unwrap();
+    fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+    r.new_tree(&["new", "inside", "--no-clone", "--path", ps(&inside)]);
+    r.new_tree(&["new", "outside", "--no-clone", "--path", ps(&sibling)]);
+
+    let list = r.run(&r.root, &["list"]).unwrap();
+    assert!(list.contains(" ~/trees/inside "), "{list}");
+    assert!(list.contains(&format!(" {} ", sibling.display())), "{list}");
+
+    let output = r
+        .run_with_env(&inside, &["list"], &[("HOME", ps(&inside))])
+        .unwrap();
+    assert!(output.contains("* ~ "), "{output}");
+
+    let json: Value = serde_json::from_str(&r.run(&r.root, &["list", "--json"]).unwrap()).unwrap();
+    let paths: Vec<&str> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&ps(&inside)), "{paths:?}");
+}
+
+#[test]
 fn config_url_matching_and_full_namespace() {
     let r = Repo::new();
     let scoped = r.trees.join("company");
